@@ -76,12 +76,14 @@ def copy_runtime_files(source_dir: Path, install_dir: Path) -> list[Path]:
 def _use_bash_launcher() -> bool:
     """Whether the installed statusLine launcher should run via bash.
 
-    On posix we always use bash. On Windows we use bash when a working bash is
-    on PATH so Claude Code installs that spawn statusLine through a bash-style
-    shell (e.g. Git Bash, where `.cmd` is not executable and the command
-    silently produces no output) still render. Hosts without a working bash
-    fall back to the bare `.cmd` launcher, which works under cmd and
-    PowerShell.
+    On posix we always use bash. On Windows we use bash when a working bash
+    is on PATH so Claude Code installs that spawn statusLine through a
+    bash-style shell (e.g. Git Bash) still render. Hosts without a working
+    bash fall back to a direct `python.exe statusline.py` invocation via
+    `_windows_python_command`, because Claude Code on Windows cannot spawn
+    a `.cmd` file via the statusLine command field (its tokeniser parses
+    the field bash-style: backslashes are eaten as escapes, and `.cmd` is
+    not a PE binary).
 
     The probe (`bash -c "exit 0"`) is necessary because the WSL stub at
     `C:\\Windows\\System32\\bash.exe` is on PATH on most modern Windows installs
@@ -102,6 +104,17 @@ def _use_bash_launcher() -> bool:
     return result.returncode == 0
 
 
+def _to_posix(path: str | Path) -> str:
+    """Force forward slashes in a path string.
+
+    Claude Code on Windows parses statusLine.command bash-style, so any
+    backslash in an emitted path is eaten as an escape character and the
+    resulting command silently fails to spawn. Routing every Windows path
+    we emit through this helper keeps that invariant in one place.
+    """
+    return str(path).replace("\\", "/")
+
+
 def _bash_script_arg(install_dir: Path) -> str:
     """Path to statusline.sh for use as a bash argument.
 
@@ -114,11 +127,69 @@ def _bash_script_arg(install_dir: Path) -> str:
     """
     sh_path = str(install_dir / "statusline.sh")
     if os.name == "nt":
-        sh_path = sh_path.replace("\\", "/")
+        sh_path = _to_posix(sh_path)
     return sh_path
 
 
+# Path punctuation safe to emit in an unquoted, bash-tokenised command. With
+# the ASCII letters and digits (checked separately) this covers every standard
+# Windows install path (`C:/Users/<name>/AppData/.../python.exe` and
+# `~/.claude/plugins/claude-usage-monitor/statusline.py`). Non-ASCII characters
+# are allowed too because Claude Code's bash-style tokeniser treats them
+# literally. Allowlisting means a stray space, quote, `&`, `;`, or `(` can
+# never slip through the way it could with a denylist. Backslashes never reach
+# the check because _to_posix has already turned them into forward slashes.
+_LAUNCHER_SAFE_PUNCT = "/:._-"
+
+
+def _windows_python_command(install_dir: Path) -> str:
+    """Direct `python.exe statusline.py` invocation for Windows without bash.
+
+    Claude Code on Windows parses statusLine.command bash-style: backslashes
+    in paths are eaten as escape characters, quoting paths does not survive
+    the tokeniser, and `.cmd` files won't spawn as PE binaries. So we emit
+    two forward-slash, unquoted paths separated by a single space.
+
+    The `-X utf8` flag puts Python in UTF-8 mode so it decodes the stdin
+    payload as UTF-8, matching the `PYTHONUTF8=1` the `.cmd` wrapper sets.
+    Without it the default Windows locale (cp1252) mangles or fails to decode
+    a payload with non-ASCII workspace data, which blanks the statusline.
+
+    Raises SystemExit if `sys.executable` or the install directory contains an
+    ASCII character outside the alphanumerics and `_LAUNCHER_SAFE_PUNCT` (a
+    space, quote, `&`, `;`, `(`, and so on), because the tokeniser would not
+    parse the unquoted command literally and would silently leave the
+    statusline blank -- the exact failure mode this fallback exists to fix. An
+    all-users Python install (`C:\\Program Files\\Python313`) trips on the
+    space; a profile like `C:\\Users\\O'Connor` on the quote; an install dir
+    like `C:\\Tools\\R&D` on the ampersand. Either way the user should install
+    Git Bash (so the bash launcher form is used) or reinstall under a path made
+    of ordinary characters.
+    """
+    py = _to_posix(sys.executable)
+    script = _to_posix(install_dir / "statusline.py")
+    bad = sorted(
+        {c for c in py + script
+         if ord(c) < 128 and not c.isalnum() and c not in _LAUNCHER_SAFE_PUNCT}
+    )
+    if bad:
+        raise SystemExit(
+            f"Cannot emit the Windows python fallback: a path contains {bad!r}, "
+            "which Claude Code's bash-style statusLine tokeniser does not parse "
+            "literally, so the command would be mangled and the statusline "
+            "would stay blank.\n"
+            f"  python: {py}\n"
+            f"  script: {script}\n"
+            "Install Git Bash (the installer will then use the bash launcher "
+            "form), or reinstall Python or the plugin under a path made of "
+            "ordinary characters (letters, digits, and / : . _ -)."
+        )
+    return f"{py} -X utf8 {script}"
+
+
 def build_status_command(install_dir: Path) -> str:
+    # No posix fallback below: _use_bash_launcher() returns False only on
+    # Windows, so the trailing python-command return always handles that case.
     if _use_bash_launcher():
         sh_arg = _bash_script_arg(install_dir)
         if os.name == "nt":
@@ -126,7 +197,7 @@ def build_status_command(install_dir: Path) -> str:
             # as one argument across spaces, and bash receives it intact.
             return f'bash "{sh_arg}"'
         return f"bash {shlex.quote(sh_arg)}"
-    return str(install_dir / "statusline.cmd")
+    return _windows_python_command(install_dir)
 
 
 def build_verify_command(install_dir: Path) -> str:
@@ -135,7 +206,7 @@ def build_verify_command(install_dir: Path) -> str:
         if os.name == "nt":
             return f'printf "" | bash "{sh_arg}"'
         return f"printf '' | bash {shlex.quote(sh_arg)}"
-    return f'type nul | "{install_dir / "statusline.cmd"}"'
+    return f"type nul | {_windows_python_command(install_dir)}"
 
 
 def load_settings(path: Path) -> tuple[dict, str]:
@@ -192,7 +263,9 @@ def verify_install(install_dir: Path) -> tuple[bool, str]:
     if _use_bash_launcher():
         command = ["bash", _bash_script_arg(install_dir)]
     else:
-        command = ["cmd", "/c", str(install_dir / "statusline.cmd")]
+        # No _to_posix here: the list form goes straight to the OS, not through
+        # the bash-style tokeniser, so backslashes resolve fine.
+        command = [sys.executable, "-X", "utf8", str(install_dir / "statusline.py")]
 
     try:
         proc = subprocess.run(
